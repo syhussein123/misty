@@ -1,3 +1,11 @@
+# Run with PYTHONPATH=Python-SDK python3 misty.py
+from mistyPy.GenerateRobot import RobotGenerator
+from mistyPy.Robot import Robot
+
+# Run once to update the command list. Comment this out after it succeeds.
+#RobotGenerator("192.168.0.149")
+
+misty = Robot("192.168.0.149")
 import time
 import random
 import threading
@@ -8,10 +16,7 @@ from mistyPy.Events import Events
 
 # ============================================================
 # ROBOT SETUP
-# ============================================================
-
-misty = Robot()
-
+# ===========================================================
 
 # ============================================================
 # INTERACTION CONFIGURATION
@@ -47,9 +52,9 @@ TAG_FOR_ACTIVITY = {
 }
 
 TAG_LABEL = {
-    1: "red",
-    2: "blue",
-    3: "yellow",
+    1: "1",
+    2: "2",
+    3: "3",
 }
 
 
@@ -577,7 +582,7 @@ def do_dance():
     return_gaze()
 
     say(
-        "Red! Let's dance!"
+        "You chose ID number 1! Let's dance!"
     )
 
     # ICONIC gesture:
@@ -619,33 +624,13 @@ def do_dance():
 
 
 def do_sing():
-
     show_face("happy")
-
     return_gaze()
-
-    say(
-        "Blue! Here's a little song."
-    )
-
-    misty.change_led(
-        0,
-        0,
-        255
-    )
-
-    beat_gesture()
-
-    say(
-        "La la la, la la la, "
-        "I'm the happy robot behind the glass!"
-    )
-
-    misty.change_led(
-        100,
-        70,
-        160
-    )
+    say("Number 2! Here's a little song for you.")  # or change this line to your own wording
+    misty.change_led(0, 0, 255)
+    misty.play_audio(fileName="baby.mp3", volume=100)
+    time.sleep(12)  # wait for the clip to finish
+    misty.change_led(100, 70, 160)
 
 
 def do_joke():
@@ -655,7 +640,7 @@ def do_joke():
     return_gaze()
 
     say(
-        "Yellow! I have a joke for you."
+        "You chose ID number 3! I have a joke for you."
     )
 
     time.sleep(0.4)
@@ -703,19 +688,19 @@ def explain_choices():
     beat_gesture()
 
     say(
-        "Red is dance."
+        "1 is dance." # originally red 
     )
 
     beat_gesture()
 
     say(
-        "Blue is a song."
+        "2 is a song." #originally blue
     )
 
     beat_gesture()
 
     say(
-        "Yellow is a joke."
+        "3 is a joke." #originally yellow
     )
 
     say(
@@ -783,7 +768,7 @@ def wait_for_card():
 
             say(
                 "Take your time. "
-                "You can choose red, blue, or yellow.",
+                "You can choose 1 of 3 different actions",
                 pause=2.2
             )
 
@@ -816,7 +801,7 @@ def acknowledge_card(tag):
     show_face("happy")
 
     say(
-        f"{color.capitalize()}! Good choice.",
+        f"You chose {color.capitalize()}! Good choice.",
         pause=1.3
     )
 

@@ -1,0 +1,3 @@
+[submodule "Python-SDK"]
+	path = Python-SDK
+	url = https://github.com/MistyCommunity/Python-SDK
