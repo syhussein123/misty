@@ -29,9 +29,6 @@ WAIT_FOR_CARD_SECONDS = 10
 # Give one polite reminder while waiting.
 CARD_REMINDER_SECONDS = 5
 
-# Maximum activities per visitor.
-MAX_ROUNDS = 2
-
 # AR settings
 AR_DICTIONARY = 7
 TAG_SIZE_MM = 100
@@ -85,11 +82,6 @@ MAX_GAZE_YAW = 25
 BRIEF_GLANCE_SECONDS = 0.7
 MUTUAL_GAZE_SECONDS = 1.2
 GAZE_AVERSION_SECONDS = 0.8
-
-
-# ============================================================
-# SHARED STATE
-# ============================================================
 
 conversation_lock = threading.Lock()
 notice_lock = threading.Lock()
@@ -166,8 +158,8 @@ def say(text, pause=None):
     """
 
     print("MISTY:", text)
-
-    misty.speak(text, speechRate = 2)
+    misty.set_default_volume(50)
+    misty.speak(text, speechRate = 1.75)
 
     if pause is None:
         pause = max(1.4, len(text) / 13)
@@ -347,7 +339,7 @@ def wave():
     SYMBOLIC gesture:
     conventional hello / goodbye.
     """
-
+    
     misty.move_arms(
         None,
         -45,
@@ -567,7 +559,6 @@ def notice_passed_person():
 # ============================================================
 
 def do_dance():
-
     show_face("happy")
     return_gaze()
     say("Let's dance!")
@@ -575,7 +566,7 @@ def do_dance():
     # ICONIC gesture:
     # body movement represents dancing.
 
-    misty.drive_time(linearVelocity=0, angularVelocity=100, timeMs=8550)
+    misty.drive_time(linearVelocity=0, angularVelocity=-100, timeMs=8550)
 
     misty.move_arms(-25, -25, duration=0.6)
 
@@ -594,6 +585,7 @@ def do_dance():
 
 def do_sing():
     show_face("happy")
+    misty.start_action("Love")
     return_gaze()
     musicLib = ["baby.mp3", "beautiful.mp3"]
     song = random.choice(musicLib)
@@ -605,9 +597,9 @@ def do_sing():
 
 
 def do_joke():
-
+    jokeLib = [["Why did the robot go on a diet?", "Because it had too many bytes!"], ["Why was the robot so bad at soccer?", "Because it kept kicking up sparks!"], ["Why did the robot cross the road?", "To get to the other side!"]]
+    currentJoke = random.choice(jokeLib)
     show_face("happy")
-
     return_gaze()
 
     say(
@@ -618,9 +610,7 @@ def do_joke():
 
     mutual_gaze()
 
-    say(
-        "Why did the robot cross the road?"
-    )
+    say(currentJoke[0])
 
     # Do not stare while waiting for punchline anticipation.
     gaze_aversion("side")
@@ -628,8 +618,7 @@ def do_joke():
     time.sleep(1.0)
 
     return_gaze()
-
-    say("To get to the other side!")
+    say(currentJoke[1])
     say("Ha ha! I hope you liked that one.")\
     
 ACTIVITIES = {
@@ -832,7 +821,6 @@ def no_response_goodbye():
 # FULL CONVERSATION
 # ============================================================
 def run_conversation():
-
     with conversation_lock:
         # Make sure person is still present.
         if not face_is_present():
@@ -1037,22 +1025,11 @@ def tag_callback(data):
 # ============================================================
 
 try:
-
+    misty.start_action("cute")
     show_face("idle")
-
     neutral_head()
-
-    misty.move_arms(
-        90,
-        90,
-        duration=0.8
-    )
-
-    misty.change_led(
-        100,
-        70,
-        160
-    )
+    misty.move_arms(90,90,duration=0.8)
+    misty.change_led(100,70,160)
 
     # --------------------------------------------------------
     # Face events
