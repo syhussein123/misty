@@ -13,15 +13,6 @@ import threading
 from mistyPy.Robot import Robot
 from mistyPy.Events import Events
 
-
-# ============================================================
-# ROBOT SETUP
-# ===========================================================
-
-# ============================================================
-# INTERACTION CONFIGURATION
-# ============================================================
-
 # A face is treated as gone if Misty has not seen it recently.
 GONE_AFTER_SECONDS = 3.0
 
@@ -176,7 +167,7 @@ def say(text, pause=None):
 
     print("MISTY:", text)
 
-    misty.speak(text)
+    misty.speak(text, speechRate = 2)
 
     if pause is None:
         pause = max(1.4, len(text) / 13)
@@ -578,57 +569,37 @@ def notice_passed_person():
 def do_dance():
 
     show_face("happy")
-
     return_gaze()
-
-    say(
-        "You chose ID number 1! Let's dance!"
-    )
+    say("Let's dance!")
 
     # ICONIC gesture:
     # body movement represents dancing.
 
-    misty.move_arms(
-        -25,
-        -25,
-        duration=0.6
-    )
+    misty.drive_time(linearVelocity=0, angularVelocity=100, timeMs=8550)
+
+    misty.move_arms(-25, -25, duration=0.6)
 
     for _ in range(3):
+        for _ in range(3):
+            move_head(pitch=0,roll=-5,yaw=-15,duration=0.3)
+            time.sleep(0.3)
+            move_head(pitch=0,roll=5,yaw=15,duration=0.3)
+            time.sleep(0.3)
+        misty.move_arms(90,90,duration=0.8)
 
-        move_head(
-            pitch=0,
-            roll=-5,
-            yaw=-15,
-            duration=0.3
-        )
-
-        time.sleep(0.3)
-
-        move_head(
-            pitch=0,
-            roll=5,
-            yaw=15,
-            duration=0.3
-        )
-
-        time.sleep(0.3)
-
-    misty.move_arms(
-        90,
-        90,
-        duration=0.8
-    )
-
+    time.sleep(4)
     neutral_head()
+
 
 
 def do_sing():
     show_face("happy")
     return_gaze()
+    musicLib = ["baby.mp3", "beautiful.mp3"]
+    song = random.choice(musicLib)
     say("Number 2! Here's a little song for you.")  # or change this line to your own wording
     misty.change_led(0, 0, 255)
-    misty.play_audio(fileName="baby.mp3", volume=100)
+    misty.play_audio(fileName=song, volume=100)
     time.sleep(12)  # wait for the clip to finish
     misty.change_led(100, 70, 160)
 
@@ -658,11 +629,9 @@ def do_joke():
 
     return_gaze()
 
-    say(
-        "To get to the other side!"
-    )
-
-
+    say("To get to the other side!")
+    say("Ha ha! I hope you liked that one.")\
+    
 ACTIVITIES = {
     "dance": do_dance,
     "sing": do_sing,
@@ -862,90 +831,58 @@ def no_response_goodbye():
 # ============================================================
 # FULL CONVERSATION
 # ============================================================
-
 def run_conversation():
 
     with conversation_lock:
-
         # Make sure person is still present.
         if not face_is_present():
             return
-
         zone = proxemic_zone()
 
         # Too far:
         # do not begin conversation.
         if zone in ("far", "public"):
             return
-
         # Very close:
         # soften gaze.
         if zone == "very_close":
             soft_gaze()
         else:
             mutual_gaze()
-
         show_face("friendly")
-
-        say(
-            "Oh, hello there!",
-            pause=1.0
-        )
+        say("Oh, hello there!", pause=1.0)
 
         # SYMBOLIC greeting gesture.
         wave()
-
         return_gaze()
 
-        say(
-            "I'm Misty. "
-            "Would you like to try a quick activity?"
-        )
-
+        say("I'm Misty. " "Would you like to try a quick activity?")
         open_invitation_gesture()
 
         # We cannot infer verbal "yes" yet,
         # so presenting a card becomes the user's action of engagement.
         explain_choices()
-
         rounds = 0
-
-        while rounds < MAX_ROUNDS:
-
-            if not face_is_present():
-                break
-
+        # Keep taking cards until the visitor leaves or stops responding.
+        while face_is_present():
             tag = wait_for_card()
-
+            # No card in time: the visitor stopped responding or left.
             if tag is None:
-
                 if face_is_present():
                     no_response_goodbye()
-
                 break
-
             rounds += 1
-
             acknowledge_card(tag)
-
-            if rounds >= MAX_ROUNDS:
-                break
-
+            # Visitor walked away during the activity.
             if not face_is_present():
                 break
-
-            # Offer exactly once.
+            # Offer another round, then wait for the next card.
             return_gaze()
 
-            say(
-                "Would you like to try another card?"
-            )
-
+            say("Would you like to try another card?")
             # Human turn begins.
             gaze_aversion("side")
-
         polite_goodbye()
-
 
 # ============================================================
 # ENGAGEMENT MONITOR
