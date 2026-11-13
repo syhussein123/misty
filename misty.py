@@ -1,1094 +1,892 @@
-# Run with PYTHONPATH=Python-SDK python3 misty.py
-from mistyPy.GenerateRobot import RobotGenerator
-from mistyPy.Robot import Robot
+"""Window interaction. Run with PYTHONPATH=Python-SDK python3 misty.py.
 
-# Run once to update the command list. Comment this out after it succeeds.
-#RobotGenerator("192.168.0.149")
+Only the main behavior loop sends robot commands. SDK callbacks only update
+state under a lock. Importing this module never connects to or moves the robot.
+"""
 
-misty = Robot("192.168.0.149")
-import time
+import argparse
+import base64
+from contextlib import contextmanager
+from dataclasses import dataclass
+import json
+import logging
+import math
+from pathlib import Path
 import random
+import signal
 import threading
+import time
 
-from mistyPy.Robot import Robot
-from mistyPy.Events import Events
 
-# A face is treated as gone if Misty has not seen it recently.
-GONE_AFTER_SECONDS = 3.0
-
-# Face event frequency.
-FACE_DEBOUNCE_MS = 300
-
-# Require a person to remain visible before starting conversation.
-# This prevents Misty from talking to every passerby.
-ENGAGEMENT_DWELL_SECONDS = 1.2
-
-# Waiting for AR card.
-WAIT_FOR_CARD_SECONDS = 10
-
-# Give one polite reminder while waiting.
-CARD_REMINDER_SECONDS = 5
-
-# AR settings
+LOG = logging.getLogger("misty")
+TAG_FOR_ACTIVITY = {1: "dance", 2: "sing", 3: "joke"}
 AR_DICTIONARY = 7
 TAG_SIZE_MM = 100
-
-TAG_FOR_ACTIVITY = {
-    1: "dance",
-    2: "sing",
-    3: "joke",
-}
-
-TAG_LABEL = {
-    1: "1",
-    2: "2",
-    3: "3",
-}
-
-
-# ============================================================
-# PROXEMICS
-# ============================================================
-
-"""
-IMPORTANT:
-The FaceRecognition event exposes Distance, Bearing, Elevation.
-
-Misty documentation shows these fields, but your particular robot/
-firmware should be calibrated before treating Distance as an exact
-physical distance for the design paper.
-
-We therefore use it conservatively.
-
-These thresholds are DESIGN PARAMETERS, not universal HRI rules.
-Tune them after testing through your glass window.
-"""
-
-FAR_DISTANCE = 250
-INVITATION_DISTANCE = 180
-CLOSE_DISTANCE = 70
-
-
-# ============================================================
-# HEAD / GAZE CONFIGURATION
-# ============================================================
-
-# Head yaw:
-# positive = Misty's left
-# negative = Misty's right
-
-MAX_GAZE_YAW = 25
-
-BRIEF_GLANCE_SECONDS = 0.7
-MUTUAL_GAZE_SECONDS = 1.2
-GAZE_AVERSION_SECONDS = 0.8
-
-conversation_lock = threading.Lock()
-notice_lock = threading.Lock()
-
-card_event = threading.Event()
-
-accepting_cards = False
-chosen = {"tag": None}
-
-last_seen_time = 0
-first_seen_time = 0
-
-latest_face = {
-    "bearing": 0,
-    "elevation": 0,
-    "distance": None,
-}
-
-engagement_thread_running = False
-
-
-# ============================================================
-# OPTIONAL FACIAL EXPRESSIONS
-# ============================================================
-
-"""
-If you upload custom images or know the built-in image names,
-put them here.
-
-If left as None, the code still runs.
-
-Example:
-FACE_IMAGES["happy"] = "e_Joy2.jpg"
-"""
-
+JOKES = (
+    ("Why did the robot go on a diet?", "Because it had too many bytes!"),
+    ("Why was the robot so bad at soccer?", "Because it kept kicking up sparks!"),
+    ("Why did the robot cross the road?", "To get to the other side!"),
+)
 FACE_IMAGES = {
-    "idle": None,
-    "friendly": None,
-    "happy": None,
-    "thinking": None,
-    "confused": None,
-    "goodbye": None,
+    "idle": "e_DefaultContent.jpg",
+    "friendly": "e_Joy.jpg",
+    "happy": "e_Joy2.jpg",
+    "thinking": "eyes_pensiveness.jpg",
+    "confused": "e_Disoriented.jpg",
+    "goodbye": "e_Joy.jpg",
 }
 
 
-def show_face(name):
+@dataclass(frozen=True)
+class Settings:
+    leave_seconds: float = 4.0
+    dwell_seconds: float = 1.2
+    fresh_seconds: float = 1.0
+    reacquire_seconds: float = 1.0
+    card_wait_seconds: float = 10.0
+    card_reminder_seconds: float = 5.0
+    card_release_seconds: float = 1.0
+    confidence: float = 0.6
+    detector_width: float = 320.0
+    detector_height: float = 320.0
+    card_yaw: float = -18.0
+    card_pitch: float = 8.0
+    spoken_prompts: bool = True
+    speech_volume: int = 50
+    speech_rate: float = 1.75
+    songs: tuple = ("baby.mp3", "beautiful.mp3")
+    dance_skill: str = ""
+    dance_rotation_seconds: float = 8.55
+    dance_angular_velocity: float = -100.0
+    startup_action: str = "cute"
+    music_action: str = "Love"
+    activity_timeout: float = 60.0
+
+
+class VisitPresence:
+    """One claim per occupied-scene episode; caller holds the state lock.
+
+    A face turning away cannot end a visit: only person observations are used.
+    Short gaps keep the same epoch. Long gaps create a new epoch even when a
+    new observation arrives before the behavior loop has checked for absence.
     """
-    Optional facial-expression wrapper.
 
-    Different mistyPy versions expose generated commands slightly
-    differently, so this function fails safely.
-    """
+    def __init__(self, settings):
+        self.settings = settings
+        self.last_seen = None
+        self.visible_since = None
+        self.occupied = False
+        self.epoch = 0
+        self.claimed_epoch = 0
+        self.paused = 0
+        self.observe_after = 0.0
 
-    filename = FACE_IMAGES.get(name)
+    def expire(self, now):
+        if (self.occupied and not self.paused and
+                now - max(self.last_seen, self.observe_after) >= self.settings.leave_seconds):
+            self.occupied = False
 
-    if not filename:
-        return
+    def observe(self, now):
+        self.expire(now)
+        if not self.occupied:
+            self.epoch += 1
+            self.occupied = True
+        if self.last_seen is None or now - self.last_seen > self.settings.fresh_seconds:
+            self.visible_since = now
+        self.last_seen = now
 
+    def claim(self, now):
+        self.expire(now)
+        if self.occupied and self.epoch != self.claimed_epoch:
+            self.claimed_epoch = self.epoch
+            return self.epoch
+        return None
+
+    def present(self, epoch, now):
+        self.expire(now)
+        return self.occupied and self.epoch == epoch
+
+    def ready(self, epoch, now):
+        return (self.present(epoch, now) and
+                now - self.last_seen <= self.settings.fresh_seconds and
+                now - self.visible_since >= self.settings.dwell_seconds)
+
+    def resume(self, now):
+        self.paused -= 1
+        if not self.paused:
+            # A deliberate look-away is not evidence that the person left.
+            self.observe_after = now + self.settings.reacquire_seconds
+
+
+class CardInput:
+    """A single selection per waiting round; caller holds the state lock."""
+
+    def __init__(self, release_seconds):
+        self.release_seconds = release_seconds
+        self.last_seen = {}
+        self.consumed = set()
+        self.epoch = None
+        self.deadline = 0.0
+        self.accepting = False
+        self.pending = None
+
+    def begin(self, epoch, deadline):
+        self.epoch, self.deadline = epoch, deadline
+        self.pending = None
+        self.accepting = True
+
+    def close(self):
+        self.accepting = False
+        self.pending = None
+
+    def observe(self, tag, now, epoch, present, reliable_view=True):
+        previous = self.last_seen.get(tag)
+        if (reliable_view and previous is not None and
+                now - previous >= self.release_seconds):
+            self.consumed.discard(tag)
+        self.last_seen[tag] = max(now, previous if previous is not None else now)
+        if (not self.accepting or not present or epoch != self.epoch or
+                now >= self.deadline or tag in self.consumed):
+            return
+        self.pending = ("valid" if tag in TAG_FOR_ACTIVITY else "invalid", tag)
+        self.consumed.add(tag)
+        self.accepting = False
+
+    def resumed_view(self, now, grace):
+        # Losing the card while our own camera turns is not card removal.
+        for tag in self.consumed:
+            self.last_seen[tag] = max(self.last_seen.get(tag, now), now + grace)
+
+
+def message(data):
+    if not isinstance(data, dict):
+        return {}
+    value = data.get("message", data.get("Message", {}))
+    return {str(k).lower(): v for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+def number(value):
+    if isinstance(value, bool):
+        return None
     try:
-        misty.display_image(filename)
-    except Exception as exc:
-        print(f"[face image skipped: {exc}]")
-
-
-# ============================================================
-# BASIC SPEECH
-# ============================================================
-
-def say(text, pause=None):
-    """
-    Speak and wait long enough to avoid overlapping lines.
-
-    Keep speech short and clear.
-    """
-
-    print("MISTY:", text)
-    misty.set_default_volume(50)
-    misty.speak(text, speechRate = 1.75)
-
-    if pause is None:
-        pause = max(1.4, len(text) / 13)
-
-    time.sleep(pause)
-
-
-# ============================================================
-# HEAD / GAZE HELPERS
-# ============================================================
-
-def move_head(pitch=0, roll=0, yaw=0, duration=0.45):
-    """
-    Safe wrapper around Misty's MoveHead command.
-
-    Current Misty API supports pitch, roll, yaw and either
-    duration OR velocity. Do not supply both. 
-    """
-
-    try:
-        misty.move_head(
-            pitch=pitch,
-            roll=roll,
-            yaw=yaw,
-            duration=duration,
-            units="degrees"
-        )
-
-    except TypeError:
-        # Some generated mistyPy versions may prefer positional args.
-        # Fall back to velocity mode.
-        try:
-            misty.move_head(
-                pitch,
-                roll,
-                yaw,
-                velocity=30,
-                units="degrees"
-            )
-        except Exception as exc:
-            print(f"[head motion skipped: {exc}]")
-
-    except Exception as exc:
-        print(f"[head motion skipped: {exc}]")
-
-
-def neutral_head():
-    move_head(
-        pitch=0,
-        roll=0,
-        yaw=0,
-        duration=0.4
-    )
+        value = float(value)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def look_toward_latest_face():
-    """
-    Uses FaceRecognition bearing/elevation to orient Misty's head.
-
-    We intentionally clamp the movement so Misty does not
-    dramatically track a passerby.
-    """
-
-    bearing = latest_face.get("bearing") or 0
-    elevation = latest_face.get("elevation") or 0
-
-    yaw = clamp(bearing, -MAX_GAZE_YAW, MAX_GAZE_YAW)
-
-    # Elevation mapping may need tuning on your robot.
-    pitch = clamp(-elevation, -10, 10)
-
-    move_head(
-        pitch=pitch,
-        roll=0,
-        yaw=yaw,
-        duration=0.4
-    )
-
-
-def brief_glance():
-    """
-    Low-intensity acknowledgement.
-
-    HRI idea:
-    "I noticed you" without strong mutual gaze.
-    """
-
-    look_toward_latest_face()
-
-    time.sleep(BRIEF_GLANCE_SECONDS)
-
-    # Slight gaze aversion
-    direction = random.choice([-8, 8])
-
-    move_head(
-        pitch=2,
-        yaw=direction,
-        duration=0.35
-    )
-
-
-def mutual_gaze():
-    """
-    Short mutual gaze after a person has engaged.
-    """
-
-    look_toward_latest_face()
-
-    time.sleep(MUTUAL_GAZE_SECONDS)
-
-
-def gaze_aversion(style="side"):
-    """
-    Deliberately break direct gaze.
-
-    Used when:
-    - waiting for the person
-    - Misty is "thinking"
-    - processing a card
-    - avoiding continuous staring
-    """
-
-    if style == "down":
-        pitch = 8
-        yaw = random.choice([-5, 5])
-
-    elif style == "thinking":
-        pitch = -4
-        yaw = random.choice([-12, 12])
-
-    else:
-        pitch = 2
-        yaw = random.choice([-12, 12])
-
-    move_head(
-        pitch=pitch,
-        roll=0,
-        yaw=yaw,
-        duration=0.45
-    )
-
-    time.sleep(GAZE_AVERSION_SECONDS)
-
-
-def return_gaze():
-    look_toward_latest_face()
-
-
-def soft_gaze():
-    """
-    Used when someone is very close.
-    Less intense than full direct gaze.
-    """
-
-    bearing = latest_face.get("bearing") or 0
-
-    yaw = clamp(bearing, -8, 8)
-
-    move_head(
-        pitch=4,
-        roll=0,
-        yaw=yaw,
-        duration=0.5
-    )
-
-
-# ============================================================
-# GESTURES
-# ============================================================
-
-def wave():
-    """
-    SYMBOLIC gesture:
-    conventional hello / goodbye.
-    """
-    
-    misty.move_arms(
-        None,
-        -45,
-        duration=1.0
-    )
-
-    time.sleep(0.8)
-
-    for _ in range(2):
-        misty.move_arms(
-            None,
-            -20,
-            duration=0.3
-        )
-
-        time.sleep(0.3)
-
-        misty.move_arms(
-            None,
-            -45,
-            duration=0.3
-        )
-
-        time.sleep(0.3)
-
-    misty.move_arms(
-        None,
-        90,
-        duration=0.8
-    )
-
-
-def small_wave():
-    """
-    Lower-intensity wave for a passerby.
-    """
-
-    misty.move_arms(
-        None,
-        -20,
-        duration=0.5
-    )
-
-    time.sleep(0.4)
-
-    misty.move_arms(
-        None,
-        5,
-        duration=0.35
-    )
-
-    time.sleep(0.3)
-
-    misty.move_arms(
-        None,
-        90,
-        duration=0.6
-    )
-
-
-def beat_gesture():
-    """
-    BEAT gesture:
-    small rhythmic arm movement aligned with speech.
-    """
-
-    misty.move_arms(
-        None,
-        30,
-        duration=0.25
-    )
-
-    time.sleep(0.25)
-
-    misty.move_arms(
-        None,
-        55,
-        duration=0.25
-    )
-
-    time.sleep(0.25)
-
-    misty.move_arms(
-        None,
-        90,
-        duration=0.35
-    )
-
-
-def open_invitation_gesture():
-    """
-    Open-arm invitation.
-
-    Not meant to imitate a human exactly.
-    It simply supports the verbal invitation.
-    """
-
-    misty.move_arms(
-        35,
-        35,
-        duration=0.6
-    )
-
-    time.sleep(0.6)
-
-    misty.move_arms(
-        90,
-        90,
-        duration=0.6
-    )
-
-
-def thinking_pose():
-    """
-    Slight head tilt + gaze aversion.
-    """
-
-    show_face("thinking")
-
-    move_head(
-        pitch=-3,
-        roll=5,
-        yaw=12,
-        duration=0.5
-    )
-
-
-def confused_pose():
-    """
-    Makes failure legible instead of pretending Misty understood.
-    """
-
-    show_face("confused")
-
-    move_head(
-        pitch=4,
-        roll=7,
-        yaw=-8,
-        duration=0.5
-    )
-
-
-# ============================================================
-# FACE / PERSON PRESENCE
-# ============================================================
-
-def face_is_present():
-    return (time.time() - last_seen_time) < GONE_AFTER_SECONDS
-
-
-def current_distance():
-    return latest_face.get("distance")
-
-
-def proxemic_zone():
-    """
-    Returns a coarse interaction zone.
-
-    We do NOT rely on this alone to decide engagement.
-    """
-
-    distance = current_distance()
-
-    if distance is None:
-        return "unknown"
-
-    if distance > FAR_DISTANCE:
-        return "far"
-
-    if distance > INVITATION_DISTANCE:
-        return "public"
-
-    if distance > CLOSE_DISTANCE:
-        return "social"
-
-    return "very_close"
-
-
-# ============================================================
-# FIRST-CONTACT BEHAVIOR
-# ============================================================
-
-def notice_passed_person():
-    """
-    Person has entered the camera view, but we do NOT yet
-    know whether they want to interact.
-
-    This is intentionally subtle.
-    """
-
-    if notice_lock.locked():
-        return
-
-    with notice_lock:
-
-        if conversation_lock.locked():
+def response_result(response, allow_false=False):
+    """SDK commands return HTTP responses, including on robot-side failure."""
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise RuntimeError("Unexpected robot response")
+    status = body.get("status", body.get("Status", "Success"))
+    result = body.get("result", body.get("Result"))
+    if str(status).lower() != "success" or (result is False and not allow_false):
+        raise RuntimeError("Robot rejected command: %s" % body)
+    return result
+
+
+class VisitorLeft(Exception):
+    pass
+
+
+class Stopping(Exception):
+    pass
+
+
+class Interaction:
+    def __init__(self, robot, settings=None, clock=time.monotonic):
+        self.robot = robot
+        self.settings = settings or Settings()
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.presence = VisitPresence(self.settings)
+        self.cards = CardInput(self.settings.card_release_seconds)
+        self.active_epoch = None
+        self.target = None
+        self.head = {"pitch": 0.0, "yaw": 0.0}
+        self.last_gaze_time = -math.inf
+        self.last_gaze_frame = None
+        self.audio_expected = None
+        self.audio_complete = False
+        self.speech_expected = None
+        self.speech_complete = False
+        self.speech_sequence = 0
+        self.images = set()
+        self.songs = []
+        self.skills = []
+        self.running_skill = None
+        self.actions = {}
+        self.running_action = None
+        self.registrations = []
+        self.detectors = []
+        self.stage = "IDLE"
+
+    def command(self, name, *args, **kwargs):
+        # Stop endpoints may report False when nothing was running. HTTP/API
+        # errors still fail; an already stopped activity is a successful reset.
+        idempotent = name in {"stop", "stop_audio", "stop_speaking", "cancel_skill",
+                              "stop_object_detector", "stop_ar_tag_detector", "stop_action"}
+        return response_result(getattr(self.robot, name)(*args, **kwargs),
+                               allow_false=idempotent)
+
+    def best_effort(self, name, *args, **kwargs):
+        try:
+            self.command(name, *args, **kwargs)
+        except Exception as exc:
+            LOG.warning("%s failed: %s", name, exc)
+
+    def set_stage(self, stage):
+        if stage != self.stage:
+            self.stage = stage
+            LOG.info("State: %s (visit %s)", stage, self.active_epoch)
+
+    def person_callback(self, data):
+        msg = message(data)
+        confidence = number(msg.get("confidence"))
+        if (str(msg.get("description", "")).lower() != "person" or
+                confidence is None or confidence < self.settings.confidence):
             return
-
-        zone = proxemic_zone()
-
-        if zone == "far":
-            # No engagement at all.
+        box = tuple(number(msg.get("imagelocation" + side))
+                    for side in ("left", "top", "right", "bottom"))
+        if any(value is None for value in box):
             return
-
-        brief_glance()
-
-        # Only a tiny wave in public/social space.
-        if zone in ("public", "social"):
-            small_wave()
-
-        # Then stop.
-        neutral_head()
-
-
-# ============================================================
-# ACTIVITIES
-# ============================================================
-
-def do_dance():
-    show_face("happy")
-    return_gaze()
-    say("Let's dance!")
-
-    # ICONIC gesture:
-    # body movement represents dancing.
-
-    misty.drive_time(linearVelocity=0, angularVelocity=-100, timeMs=8550)
-
-    misty.move_arms(-25, -25, duration=0.6)
-
-    for _ in range(3):
-        for _ in range(3):
-            move_head(pitch=0,roll=-5,yaw=-15,duration=0.3)
-            time.sleep(0.3)
-            move_head(pitch=0,roll=5,yaw=15,duration=0.3)
-            time.sleep(0.3)
-        misty.move_arms(90,90,duration=0.8)
-
-    time.sleep(4)
-    neutral_head()
-
-
-
-def do_sing():
-    show_face("happy")
-    misty.start_action("Love")
-    return_gaze()
-    musicLib = ["baby.mp3", "beautiful.mp3"]
-    song = random.choice(musicLib)
-    say("Number 2! Here's a little song for you.")  # or change this line to your own wording
-    misty.change_led(0, 0, 255)
-    misty.play_audio(fileName=song, volume=100)
-    time.sleep(12)  # wait for the clip to finish
-    misty.change_led(100, 70, 160)
-
-
-def do_joke():
-    jokeLib = [["Why did the robot go on a diet?", "Because it had too many bytes!"], ["Why was the robot so bad at soccer?", "Because it kept kicking up sparks!"], ["Why did the robot cross the road?", "To get to the other side!"]]
-    currentJoke = random.choice(jokeLib)
-    show_face("happy")
-    return_gaze()
-
-    say(
-        "You chose ID number 3! I have a joke for you."
-    )
-
-    time.sleep(0.4)
-
-    mutual_gaze()
-
-    say(currentJoke[0])
-
-    # Do not stare while waiting for punchline anticipation.
-    gaze_aversion("side")
-
-    time.sleep(1.0)
-
-    return_gaze()
-    say(currentJoke[1])
-    say("Ha ha! I hope you liked that one.")\
-    
-ACTIVITIES = {
-    "dance": do_dance,
-    "sing": do_sing,
-    "joke": do_joke,
-}
-
-
-# ============================================================
-# CARD CHOICE / DIALOGUE MANAGEMENT
-# ============================================================
-
-def explain_choices():
-
-    show_face("friendly")
-
-    return_gaze()
-
-    say(
-        "Choose one card."
-    )
-
-    # Beat gesture supports the list structure.
-    beat_gesture()
-
-    say(
-        "1 is dance." # originally red 
-    )
-
-    beat_gesture()
-
-    say(
-        "2 is a song." #originally blue
-    )
-
-    beat_gesture()
-
-    say(
-        "3 is a joke." #originally yellow
-    )
-
-    say(
-        "Hold your card up to the glass."
-    )
-
-    # Now it is the human's turn.
-    # Misty should NOT keep staring.
-    gaze_aversion("side")
-
-
-def wait_for_card():
-    """
-    Dialogue-management state.
-
-    Misty waits without continuous staring.
-
-    0 sec:
-        user has the turn
-
-    ~2 sec:
-        gaze aversion
-
-    ~5 sec:
-        one gentle reminder
-
-    ~10 sec:
-        politely stop
-    """
-
-    global accepting_cards
-
-    card_event.clear()
-    chosen["tag"] = None
-
-    accepting_cards = True
-
-    started = time.time()
-
-    aversion_done = False
-    reminder_done = False
-
-    while True:
-
-        if card_event.wait(timeout=0.2):
-            accepting_cards = False
-            return chosen["tag"]
-
-        elapsed = time.time() - started
-
-        # User left.
-        if not face_is_present():
-            accepting_cards = False
-            return None
-
-        # Gaze aversion while the user is choosing.
-        if elapsed >= 2.0 and not aversion_done:
-            gaze_aversion("side")
-            aversion_done = True
-
-        # One polite reminder only.
-        if elapsed >= CARD_REMINDER_SECONDS and not reminder_done:
-
-            return_gaze()
-
-            say(
-                "Take your time. "
-                "You can choose 1 of 3 different actions",
-                pause=2.2
-            )
-
-            gaze_aversion("side")
-
-            reminder_done = True
-
-        if elapsed >= WAIT_FOR_CARD_SECONDS:
-            accepting_cards = False
-            return None
-
-
-# ============================================================
-# CARD PROCESSING
-# ============================================================
-
-def acknowledge_card(tag):
-
-    color = TAG_LABEL[tag]
-    activity = TAG_FOR_ACTIVITY[tag]
-
-    # Processing state:
-    # gaze away first rather than instantly responding.
-    thinking_pose()
-
-    time.sleep(0.7)
-
-    return_gaze()
-
-    show_face("happy")
-
-    say(
-        f"You chose {color.capitalize()}! Good choice.",
-        pause=1.3
-    )
-
-    ACTIVITIES[activity]()
-
-
-# ============================================================
-# DISENGAGEMENT
-# ============================================================
-
-def polite_goodbye():
-
-    show_face("goodbye")
-
-    if face_is_present():
-        soft_gaze()
-
-        say(
-            "Thanks for playing with me. "
-            "Have a great day!"
-        )
-
-        wave()
-
-    else:
-        # User has already walked away.
-        # Do not shout after them.
-        print("[Visitor already left - silent reset]")
-
-    neutral_head()
-
-    misty.move_arms(
-        90,
-        90,
-        duration=0.8
-    )
-
-    show_face("idle")
-
-
-def no_response_goodbye():
-
-    show_face("friendly")
-
-    return_gaze()
-
-    say(
-        "No worries. Maybe next time!"
-    )
-
-    small_wave()
-
-    gaze_aversion("side")
-
-    neutral_head()
-
-
-# ============================================================
-# FULL CONVERSATION
-# ============================================================
-def run_conversation():
-    with conversation_lock:
-        # Make sure person is still present.
-        if not face_is_present():
+        left, top, right, bottom = box
+        if not (left < right and top < bottom):
             return
-        zone = proxemic_zone()
-
-        # Too far:
-        # do not begin conversation.
-        if zone in ("far", "public"):
+        # Live detector boxes can cross the image edge (e.g. left=-0.027).
+        # Clip the visible intersection instead of declaring that person gone.
+        left, right = max(0, left), min(self.settings.detector_width, right)
+        top, bottom = max(0, top), min(self.settings.detector_height, bottom)
+        if not (left < right and top < bottom):
             return
-        # Very close:
-        # soften gaze.
-        if zone == "very_close":
-            soft_gaze()
-        else:
-            mutual_gaze()
-        show_face("friendly")
-        say("Oh, hello there!", pause=1.0)
+        box = (left, top, right, bottom)
+        now = self.clock()
+        with self.lock:
+            self.presence.observe(now)
+            # Keep a recently observed target when another person is elsewhere.
+            if self.target and now - self.target["seen"] < self.settings.fresh_seconds:
+                old = self.target["box"]
+                overlap = (min(right, old[2]) > max(left, old[0]) and
+                           min(bottom, old[3]) > max(top, old[1]))
+                if not overlap:
+                    return
+            self.target = {"box": box, "seen": now, "head": dict(self.head)}
 
-        # SYMBOLIC greeting gesture.
-        wave()
-        return_gaze()
+    def tag_callback(self, data):
+        value = number(message(data).get("tagid"))
+        if value is None or value < 0 or not value.is_integer():
+            return
+        now = self.clock()
+        with self.lock:
+            self.cards.observe(int(value), now, self.active_epoch,
+                               self.presence.present(self.active_epoch, now),
+                               reliable_view=(not self.presence.paused and
+                                              now >= self.presence.observe_after))
 
-        say("I'm Misty. " "Would you like to try a quick activity?")
-        open_invitation_gesture()
+    def actuator_callback(self, data):
+        msg = message(data)
+        axis = {"ahy": "yaw", "ahp": "pitch"}.get(msg.get("sensorid"))
+        value = number(msg.get("value"))
+        if axis and value is not None:
+            with self.lock:
+                self.head[axis] = value
 
-        # We cannot infer verbal "yes" yet,
-        # so presenting a card becomes the user's action of engagement.
-        explain_choices()
-        rounds = 0
-        # Keep taking cards until the visitor leaves or stops responding.
-        while face_is_present():
-            tag = wait_for_card()
-            # No card in time: the visitor stopped responding or left.
-            if tag is None:
-                if face_is_present():
-                    no_response_goodbye()
-                break
-            rounds += 1
-            acknowledge_card(tag)
-            # Visitor walked away during the activity.
-            if not face_is_present():
-                break
-            # Offer another round, then wait for the next card.
-            return_gaze()
+    def audio_callback(self, data):
+        msg = message(data)
+        metadata = msg.get("metadata")
+        name = msg.get("filename", msg.get("name"))
+        if isinstance(metadata, dict):
+            metadata = {str(k).lower(): v for k, v in metadata.items()}
+            name = metadata.get("name", name)
+        with self.lock:
+            if name and name == self.audio_expected:
+                self.audio_complete = True
 
-            say("Would you like to try another card?")
-            # Human turn begins.
-            gaze_aversion("side")
-        polite_goodbye()
+    def speech_callback(self, data):
+        msg = message(data)
+        with self.lock:
+            if msg.get("utteranceid") == self.speech_expected and self.speech_expected:
+                self.speech_complete = True
 
-# ============================================================
-# ENGAGEMENT MONITOR
-# ============================================================
+    def checkpoint(self):
+        if self.stop_event.is_set():
+            raise Stopping()
+        # A closed input connection is not evidence that the visitor left.
+        if any(not registration.is_active for registration in self.registrations):
+            self.stop_event.set()
+            raise RuntimeError("An event connection closed; stopping instead of inferring departure")
+        with self.lock:
+            if (self.active_epoch is not None and
+                    not self.presence.present(self.active_epoch, self.clock())):
+                raise VisitorLeft()
 
-def engagement_monitor():
-    """
-    Important design improvement over the original version.
+    def pause(self, seconds, track=False):
+        deadline = self.clock() + seconds
+        while self.clock() < deadline:
+            self.checkpoint()
+            if track:
+                self.look_toward_person()
+            self.stop_event.wait(min(0.1, max(0, deadline - self.clock())))
+        self.checkpoint()
 
-    A detected face does NOT immediately trigger conversation.
+    def move_head(self, pitch=0, roll=0, yaw=0, duration=0.4):
+        self.checkpoint()
+        pitch, yaw = clamp(pitch, -15, 15), clamp(yaw, -25, 25)
+        self.command("move_head", pitch=pitch, roll=clamp(roll, -10, 10),
+                     yaw=yaw, duration=duration, units="degrees")
+        with self.lock:
+            self.head.update(pitch=pitch, yaw=yaw)
+            # Even ordinary social gaze moves the camera. Count absence only
+            # after the commanded motion has settled and vision can reacquire.
+            self.presence.observe_after = max(
+                self.presence.observe_after,
+                self.clock() + duration + self.settings.reacquire_seconds)
 
-    Misty waits to see whether the person stays.
+    def move_arms(self, left, right, duration=0.5):
+        self.checkpoint()
+        self.command("move_arms", left, right, duration=duration)
+        self.pause(duration)
 
-    This helps distinguish:
-        passerby
-        vs.
-        potentially engaged visitor
-    """
+    def show_face(self, name):
+        filename = FACE_IMAGES[name]
+        if filename in self.images:
+            self.command("display_image", filename)
 
-    global engagement_thread_running
+    def look_toward_person(self):
+        now = self.clock()
+        with self.lock:
+            target = self.target
+        if (target is None or now - target["seen"] > self.settings.fresh_seconds or
+                now - self.last_gaze_time < 0.3 or target["seen"] == self.last_gaze_frame):
+            return
+        left, top, right, bottom = target["box"]
+        x = 1 - (left + right) / self.settings.detector_width
+        # Aim near the upper part of the person box, not the torso center.
+        y = (0.8 * top + 0.2 * bottom) / (self.settings.detector_height / 2) - 1
+        yaw = target["head"]["yaw"] + (clamp(x * 12, -4, 4) if abs(x) > 0.08 else 0)
+        pitch = target["head"]["pitch"] + (clamp(y * 8, -3, 3) if abs(y) > 0.08 else 0)
+        self.move_head(pitch=pitch, yaw=yaw)
+        self.last_gaze_time, self.last_gaze_frame = now, target["seen"]
 
-    try:
+    @contextmanager
+    def visual_interruption(self):
+        """Restore observation before counting absence or card removal again."""
+        with self.lock:
+            self.presence.paused += 1
+        try:
+            yield
+        finally:
+            # No tracking thread can overwrite the deliberate pose.
+            self.best_effort("move_head", pitch=0, roll=0, yaw=0, duration=0.4, units="degrees")
+            with self.lock:
+                now = self.clock()
+                self.head.update(pitch=0, yaw=0)
+                self.target = None
+                self.presence.resume(now)
+                self.cards.resumed_view(now, self.settings.reacquire_seconds)
 
+    def say(self, text, activity=False):
+        LOG.info("MISTY: %s", text)
+        if not self.settings.spoken_prompts and not activity:
+            return
+        self.checkpoint()
+        self.speech_sequence += 1
+        utterance = "window-%d-%d" % (id(self), self.speech_sequence)
+        with self.lock:
+            self.speech_expected, self.speech_complete = utterance, False
+        try:
+            self.command("set_default_volume", self.settings.speech_volume)
+            self.command("speak", text, speechRate=self.settings.speech_rate,
+                         utteranceId=utterance)
+            deadline = self.clock() + max(8, len(text) / 8)
+            while self.clock() < deadline:
+                self.checkpoint()
+                with self.lock:
+                    done = self.speech_complete
+                if done:
+                    return
+                self.pause(0.1, track=True)
+            LOG.warning("Speech completion timed out")
+            self.best_effort("stop_speaking")
+        finally:
+            with self.lock:
+                self.speech_expected = None
+
+    def brief_glance(self):
+        self.pause(0.7, track=True)
+
+    def mutual_gaze(self):
+        self.pause(1.2, track=True)
+
+    def gaze_aversion(self):
+        with self.visual_interruption():
+            self.move_head(pitch=5, yaw=random.choice([-12, 12]))
+            self.pause(0.8)
+
+    def wave(self, small=False):
+        self.move_arms(None, -20 if small else -45)
+        for _ in range(1 if small else 2):
+            self.move_arms(None, 5 if small else -20, 0.3)
+            self.move_arms(None, -20 if small else -45, 0.3)
+        self.move_arms(None, 90)
+
+    def nod(self):
+        with self.lock:
+            yaw = self.head["yaw"]
+        self.move_head(pitch=5, yaw=yaw, duration=0.25)
+        self.pause(0.25)
+        self.move_head(pitch=-2, yaw=yaw, duration=0.25)
+        self.pause(0.25)
+
+    def card_cue(self):
+        with self.visual_interruption():
+            self.move_head(pitch=self.settings.card_pitch, yaw=self.settings.card_yaw)
+            if self.settings.card_yaw >= 0:
+                self.move_arms(25, None)
+                self.move_arms(90, None)
+            else:
+                self.move_arms(None, 25)
+                self.move_arms(None, 90)
+
+    def repair(self, text="Please show one of the cards numbered 1, 2, or 3."):
+        self.set_stage("REPAIR")
+        self.show_face("confused")
+        with self.visual_interruption():
+            self.move_head(pitch=4, roll=7, yaw=-8)
+            self.pause(0.6)
+        self.say(text)
+        self.card_cue()
+        self.show_face("friendly")
+
+    def explain_choices(self):
+        self.set_stage("VISUAL_INVITE")
+        self.show_face("friendly")
+        self.say("Choose a card. 1 is dance, 2 is music, and 3 is a joke.")
+        self.card_cue()
+
+    def wait_for_card(self, retry=False):
+        self.set_stage("WAIT")
+        started = self.clock()
+        # After the first missed read, keep accepting cards for this visit.
+        # A rescan is a new human turn, not a new greeting or a new visitor.
+        deadline = math.inf if retry else started + self.settings.card_wait_seconds
+        with self.lock:
+            self.cards.begin(self.active_epoch, deadline)
+        averted = reminded = retry
+        repaired = False
+        try:
+            if retry:
+                self.set_stage("RESCAN")
+                self.show_face("confused")
+                self.say("I didn't read the card. Let's try again. "
+                         "Lower it, then hold it steady in front of my camera. I'll keep scanning.")
+                self.show_face("friendly")
+                self.set_stage("WAIT")
+            while True:
+                self.checkpoint()  # Departure wins over queued card input.
+                with self.lock:
+                    pending = self.cards.pending
+                    self.cards.pending = None
+                if pending:
+                    kind, tag = pending
+                    if kind == "valid":
+                        return tag
+                    if not repaired:
+                        self.repair()
+                        repaired = True
+                    # Keep the original deadline so bad cards cannot trap us.
+                    with self.lock:
+                        self.cards.begin(self.active_epoch, deadline)
+                    self.set_stage("WAIT")
+                elapsed = self.clock() - started
+                if self.clock() >= deadline:
+                    return None
+                if elapsed >= 2 and not averted:
+                    self.gaze_aversion()
+                    averted = True
+                elif elapsed >= self.settings.card_reminder_seconds and not reminded:
+                    self.say("You can choose 1, 2, or 3.")
+                    self.card_cue()
+                    reminded = True
+                else:
+                    # Forward observation between brief social gaze episodes.
+                    self.pause(0.1)
+        finally:
+            with self.lock:
+                self.cards.close()
+
+    def acknowledge_card(self, tag):
+        self.set_stage("ACKNOWLEDGE")
+        self.look_toward_person()
+        self.show_face("happy")
+        self.nod()
+        self.set_stage("PROCESSING")
+        self.show_face("thinking")
+        with self.visual_interruption():
+            self.move_head(pitch=-3, roll=5, yaw=12)
+            self.pause(0.7)
+        self.set_stage("CONFIRMATION")
+        self.show_face("happy")
+        self.say("You chose %d. Good choice!" % tag)
+        self.set_stage(TAG_FOR_ACTIVITY[tag].upper())
+        {1: self.do_dance, 2: self.do_sing, 3: self.do_joke}[tag]()
+
+    def do_dance(self):
+        self.say("Let's dance with some music!")
+        with self.visual_interruption():
+            if self.settings.dance_skill:
+                self.play_dance_skill()
+            else:
+                # Combine the clockwise rotation, old.py's head/arm dance,
+                # and music.py's uploaded songs. Playback is asynchronous.
+                with self.music_playback():
+                    try:
+                        self.command("drive_time", linearVelocity=0,
+                                     angularVelocity=self.settings.dance_angular_velocity,
+                                     timeMs=int(self.settings.dance_rotation_seconds * 1000))
+                        rotation_started = self.clock()
+                        for _ in range(3):
+                            self.move_arms(-25, -25, 0.6)
+                            for _ in range(3):
+                                self.move_head(roll=-5, yaw=-15, duration=0.3)
+                                self.pause(0.3)
+                                self.move_head(roll=5, yaw=15, duration=0.3)
+                                self.pause(0.3)
+                            self.move_arms(90, 90, 0.6)
+                        self.pause(max(0, self.settings.dance_rotation_seconds -
+                                       (self.clock() - rotation_started)))
+                    finally:
+                        # Also stop if a gesture, connection, or Ctrl+C aborts.
+                        self.best_effort("stop")
+        self.pause(self.settings.reacquire_seconds)
+
+    def play_dance_skill(self):
+        skill = self.settings.dance_skill
+        self.running_skill = skill
+        try:
+            self.command("run_skill", skill=skill)
+            deadline = self.clock() + self.settings.activity_timeout
+            seen_running = False
+            while self.clock() < deadline:
+                self.pause(0.3)
+                running = self.command("get_running_skills")
+                active = any(item.get("uniqueId") == skill for item in running)
+                if active:
+                    seen_running = True
+                elif seen_running:
+                    return
+            raise RuntimeError("Dance skill did not report a complete run before timeout")
+        finally:
+            self.best_effort("cancel_skill", skill=skill)
+            self.running_skill = None
+
+    @contextmanager
+    def music_playback(self):
+        """Shared native playback for dancing and the music-only activity."""
+        if not self.songs:
+            raise RuntimeError("Neither configured song is installed on Misty")
+        song = random.choice(self.songs)
+        with self.lock:
+            self.audio_expected, self.audio_complete = song, False
+        try:
+            self.command("change_led", 0, 0, 255)
+            self.command("play_audio", fileName=song, volume=100)
+            yield song
+        finally:
+            self.best_effort("stop_audio")
+            self.best_effort("change_led", 100, 70, 160)
+            with self.lock:
+                self.audio_expected = None
+
+    @contextmanager
+    def native_action(self, name):
+        """Let an installed action own motion until it is stopped."""
+        action = self.actions.get(name.lower())
+        if action is None:
+            yield
+            return
+        with self.visual_interruption():
+            self.running_action = action
+            try:
+                self.command("start_action", action)
+                yield
+            finally:
+                self.best_effort("stop_action")
+                self.running_action = None
+
+    def do_sing(self):
+        with self.native_action(self.settings.music_action), self.music_playback():
+            deadline = self.clock() + self.settings.activity_timeout
+            while self.clock() < deadline:
+                self.checkpoint()
+                with self.lock:
+                    done = self.audio_complete
+                if done:
+                    return
+                self.pause(0.1)
+            raise RuntimeError("Music playback completion timed out")
+
+    def do_joke(self):
+        setup, punchline = random.choice(JOKES)
+        self.mutual_gaze()
+        self.say(setup, activity=True)
+        self.gaze_aversion()
+        self.pause(0.5)
+        self.say(punchline, activity=True)
+        self.show_face("happy")
+        self.say("Ha ha! I hope you liked that one.", activity=True)
+
+    def polite_goodbye(self, timeout=False):
+        self.set_stage("GOODBYE")
+        self.show_face("goodbye")
+        self.look_toward_person()
+        self.say("No worries. Maybe next time!" if timeout else "Thanks for playing. Have a great day!")
+        self.wave(small=timeout)
+
+    def run_conversation(self):
+        self.set_stage("ENGAGEMENT")
+        self.show_face("friendly")
+        self.mutual_gaze()
+        self.wave(small=True)
+        self.say("Hello! I'm Misty. Would you like to try an activity?")
+        self.explain_choices()
         while True:
+            tag = self.wait_for_card()
+            if tag is None:
+                # Keep the same visit alive. A missed scan is not a refusal.
+                tag = self.wait_for_card(retry=True)
+            try:
+                self.acknowledge_card(tag)
+            except (VisitorLeft, Stopping):
+                raise
+            except Exception:
+                LOG.exception("Activity failed")
+                self.repair("That activity didn't work. Please try another card.")
+            self.checkpoint()
+            self.set_stage("CONTINUE_CUE")
+            self.say("Would you like to try another card?")
+            self.card_cue()
 
-            if conversation_lock.locked():
-                return
+    def reset_pose(self):
+        self.best_effort("move_head", pitch=0, roll=0, yaw=0, duration=0.4, units="degrees")
+        self.best_effort("move_arms", 90, 90, duration=0.6)
+        if FACE_IMAGES["idle"] in self.images:
+            self.best_effort("display_image", FACE_IMAGES["idle"])
+        with self.lock:
+            self.head.update(pitch=0, yaw=0)
+            self.target = None
+            self.presence.observe_after = max(
+                self.presence.observe_after,
+                self.clock() + 0.4 + self.settings.reacquire_seconds)
+            self.cards.resumed_view(self.clock(), 0.4 + self.settings.reacquire_seconds)
 
-            if not face_is_present():
-                return
+    def handle_visit(self, epoch):
+        with self.lock:
+            self.active_epoch = epoch
+        try:
+            self.set_stage("NOTICE")
+            self.brief_glance()
+            while True:
+                self.checkpoint()
+                with self.lock:
+                    ready = self.presence.ready(epoch, self.clock())
+                if ready:
+                    break
+                self.pause(0.1, track=True)
+            self.run_conversation()
+        except VisitorLeft:
+            LOG.info("Visitor left; resetting without calling after them")
+        except Stopping:
+            raise
+        except Exception:
+            LOG.exception("Visit ended after an error; waiting for departure")
+        finally:
+            with self.lock:
+                self.cards.close()
+                self.active_epoch = None
+            self.best_effort("stop_speaking")
+            self.best_effort("stop_audio")
+            self.reset_pose()
+            # A finished visit stays claimed until a real absence/new entry.
+            self.set_stage("WAIT_FOR_EXIT")
 
-            visible_for = (
-                time.time() - first_seen_time
-            )
+    def load_assets(self):
+        self.images = {item["name"] for item in self.command("get_image_list")}
+        audio = {item["name"] for item in self.command("get_audio_list")}
+        self.songs = [name for name in self.settings.songs if name in audio]
+        self.skills = self.command("get_skills")
+        try:
+            self.actions = {item["name"].lower(): item["name"]
+                            for item in self.command("get_actions")}
+        except Exception as exc:
+            self.actions = {}
+            LOG.warning("Native action inventory unavailable; using scripted cues: %s", exc)
+        for name, filename in FACE_IMAGES.items():
+            if filename not in self.images:
+                LOG.warning("Expression %s unavailable: %s", name, filename)
+        if self.settings.dance_skill and not any(
+                item.get("uniqueId") == self.settings.dance_skill for item in self.skills):
+            raise RuntimeError("Configured dance skill is not installed")
+        LOG.info("Available songs: %s; dance: %s", self.songs,
+                 self.settings.dance_skill or "rotation + head/arm choreography + music")
 
-            if visible_for >= ENGAGEMENT_DWELL_SECONDS:
+    def ensure_music_assets(self, directory=None):
+        """Integrate music.py's uploader; upload only missing configured songs."""
+        root = Path(directory) if directory is not None else Path(__file__).resolve().parent
+        uploaded = False
+        for song in self.settings.songs:
+            if song in self.songs:
+                continue
+            path = root / song
+            if not path.is_file():
+                LOG.warning("Song is missing from both robot and project: %s", song)
+                continue
+            try:
+                data = path.read_bytes()
+                if len(data) > 3 * 1024 * 1024:
+                    raise ValueError("Audio exceeds Misty's 3 MB upload limit")
+                self.command("save_audio", fileName=song,
+                             data=base64.b64encode(data).decode("ascii"),
+                             immediatelyApply=False, overwriteExisting=False)
+                uploaded = True
+                LOG.info("Uploaded missing song: %s", song)
+            except Exception as exc:
+                LOG.warning("Could not upload %s: %s", song, exc)
+        if uploaded:
+            audio = {item["name"] for item in self.command("get_audio_list")}
+            self.songs = [name for name in self.settings.songs if name in audio]
 
-                zone = proxemic_zone()
+    def subscribe(self, event_type, name, callback, **kwargs):
+        # This SDK checks co_argcount == 1 and rejects bound methods directly.
+        def receive(data):
+            callback(data)
+        registration = self.robot.register_event(
+            event_type, name, callback_function=receive, keep_alive=True, **kwargs)
+        if registration is None:
+            raise RuntimeError("Failed to subscribe to " + name)
+        self.registrations.append(registration)
 
-                # Only begin full conversation in the social zone.
-                if zone in ("social", "very_close", "unknown"):
+    def start(self, events):
+        self.load_assets()
+        self.ensure_music_assets()
+        self.subscribe(events.ObjectDetection, "window_people", self.person_callback, debounce=250)
+        self.subscribe(events.ArTagDetection, "window_cards", self.tag_callback, debounce=150)
+        self.subscribe(events.AudioPlayComplete, "window_audio", self.audio_callback)
+        self.subscribe(events.TextToSpeechComplete, "window_speech", self.speech_callback)
+        for sensor in ("ahy", "ahp"):
+            self.subscribe(events.ActuatorPosition, "window_" + sensor, self.actuator_callback,
+                           debounce=200, condition=[{"Property": "SensorId", "Inequality": "=", "Value": sensor}])
+        deadline = self.clock() + 8
+        while any(registration.initial_flag for registration in self.registrations):
+            self.checkpoint()
+            if self.clock() >= deadline:
+                raise RuntimeError("Timed out waiting for event subscriptions")
+            self.stop_event.wait(0.1)
+        self.command("start_object_detector", minimumConfidence=self.settings.confidence,
+                     modelId=0, maxTrackerHistory=5)
+        self.detectors.append("stop_object_detector")
+        self.command("start_ar_tag_detector", dictionary=AR_DICTIONARY, tagSizeMm=TAG_SIZE_MM)
+        self.detectors.append("stop_ar_tag_detector")
+        if self.settings.startup_action.lower() in self.actions:
+            with self.native_action(self.settings.startup_action):
+                self.pause(2)
+        self.reset_pose()
+        self.command("change_led", 100, 70, 160)
+        LOG.info("Window-display Misty is ready: person tracking + AR cards 1/2/3")
 
-                    run_conversation()
+    def run(self):
+        while not self.stop_event.is_set():
+            self.checkpoint()
+            with self.lock:
+                epoch = self.presence.claim(self.clock())
+                occupied = self.presence.occupied
+            if epoch is not None:
+                self.handle_visit(epoch)
+            else:
+                self.set_stage("WAIT_FOR_EXIT" if occupied else "IDLE")
+                self.stop_event.wait(0.1)
 
-                return
+    def shutdown(self):
+        self.stop_event.set()
+        with self.lock:
+            self.cards.close()
+        for command in reversed(self.detectors):
+            self.best_effort(command)
+        if self.running_skill:
+            self.best_effort("cancel_skill", skill=self.running_skill)
+        if self.running_action:
+            self.best_effort("stop_action")
+        if self.detectors:
+            self.best_effort("stop_speaking")
+            self.best_effort("stop_audio")
+            self.best_effort("stop")
+            self.reset_pose()
+        self.robot.unregister_all_events()
+        LOG.info("Interaction stopped")
 
-            time.sleep(0.1)
 
+def create_robot(ip):
+    from mistyPy.Robot import Robot
+
+    class BoundedRobot(Robot):
+        def _generic_request(self, verb, endpoint, **kwargs):
+            kwargs.setdefault("timeout", (3, 5))
+            return super()._generic_request(verb, endpoint, **kwargs)
+
+    return BoundedRobot(ip)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--ip", default="192.168.0.149")
+    parser.add_argument("--silent-prompts", action="store_true", help="Keep nonverbal cues; music and joke audio still play")
+    parser.add_argument("--leave-seconds", type=float, default=4.0)
+    parser.add_argument("--card-yaw", type=float, default=-18.0, help="Positive is Misty's left")
+    parser.add_argument("--card-pitch", type=float, default=8.0)
+    parser.add_argument("--dance-skill", default="", help="Installed skill GUID; must restore the forward viewing pose")
+    parser.add_argument("--inventory", action="store_true", help="List relevant assets and exit without moving")
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.leave_seconds) or args.leave_seconds <= 1.2:
+        parser.error("--leave-seconds must be greater than the 1.2-second dwell")
+    if not (-25 <= args.card_yaw <= 25 and -15 <= args.card_pitch <= 15):
+        parser.error("Card gaze must be within yaw +/-25 and pitch +/-15 degrees")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    settings = Settings(leave_seconds=args.leave_seconds, spoken_prompts=not args.silent_prompts,
+                        card_yaw=args.card_yaw, card_pitch=args.card_pitch, dance_skill=args.dance_skill)
+    try:
+        from mistyPy.Events import Events
+        robot = create_robot(args.ip)
+    except ImportError as exc:
+        parser.exit(1, "SDK unavailable. Follow README setup and set PYTHONPATH=Python-SDK.\n%s\n" % exc)
+    app = Interaction(robot, settings)
+    if args.inventory:
+        app.load_assets()
+        print(json.dumps({"expressions": {k: v for k, v in FACE_IMAGES.items() if v in app.images},
+                          "songs": app.songs, "skills": app.skills,
+                          "actions": sorted(app.actions.values())}, indent=2))
+        return 0
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, lambda *_: app.stop_event.set())
+    try:
+        app.start(Events)
+        app.run()
+    except (KeyboardInterrupt, Stopping):
+        pass
+    except Exception:
+        LOG.exception("Interaction failed")
+        return 1
     finally:
-        engagement_thread_running = False
+        app.shutdown()
+    return 0
 
 
-# ============================================================
-# FACE CALLBACK
-# ============================================================
-
-def face_callback(data):
-
-    global last_seen_time
-    global first_seen_time
-    global engagement_thread_running
-
-    message = data.get(
-        "message",
-        {}
-    )
-
-    now = time.time()
-
-    was_gone = (
-        now - last_seen_time
-    ) > GONE_AFTER_SECONDS
-
-    last_seen_time = now
-
-    # Misty FaceRecognition messages can provide
-    # Bearing, Elevation, Distance.
-    latest_face["bearing"] = (
-        message.get("bearing")
-        if message.get("bearing") is not None
-        else message.get("Bearing", 0)
-    )
-
-    latest_face["elevation"] = (
-        message.get("elevation")
-        if message.get("elevation") is not None
-        else message.get("Elevation", 0)
-    )
-
-    latest_face["distance"] = (
-        message.get("distance")
-        if message.get("distance") is not None
-        else message.get("Distance")
-    )
-
-    if was_gone:
-
-        first_seen_time = now
-
-        # First contact:
-        # acknowledge, but don't immediately talk.
-        threading.Thread(
-            target=notice_passed_person,
-            daemon=True
-        ).start()
-
-    # Start dwell monitor once.
-    if (
-        not engagement_thread_running
-        and not conversation_lock.locked()
-    ):
-        engagement_thread_running = True
-
-        threading.Thread(
-            target=engagement_monitor,
-            daemon=True
-        ).start()
-
-
-# ============================================================
-# AR CALLBACK
-# ============================================================
-
-def tag_callback(data):
-
-    if (
-        not accepting_cards
-        or card_event.is_set()
-    ):
-        return
-
-    message = data.get(
-        "message",
-        {}
-    )
-
-    tag_id = (
-        message.get("tagId")
-        if message.get("tagId") is not None
-        else message.get("TagId")
-    )
-
-    if tag_id in TAG_FOR_ACTIVITY:
-
-        chosen["tag"] = tag_id
-
-        card_event.set()
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-try:
-    misty.start_action("cute")
-    show_face("idle")
-    neutral_head()
-    misty.move_arms(90,90,duration=0.8)
-    misty.change_led(100,70,160)
-
-    # --------------------------------------------------------
-    # Face events
-    # --------------------------------------------------------
-
-    misty.register_event(
-        Events.FaceRecognition,
-        "face_recognized",
-        callback_function=face_callback,
-        debounce=FACE_DEBOUNCE_MS,
-        keep_alive=True
-    )
-
-    # --------------------------------------------------------
-    # AR events
-    # --------------------------------------------------------
-
-    misty.register_event(
-        Events.ArTagDetection,
-        "tags_seen",
-        callback_function=tag_callback,
-        keep_alive=True
-    )
-
-    misty.start_face_recognition()
-
-    misty.start_ar_tag_detector(
-        dictionary=AR_DICTIONARY,
-        tagSizeMm=TAG_SIZE_MM
-    )
-
-    print(
-        "Window-display Misty is ready.",
-        flush=True
-    )
-
-    misty.keep_alive()
-
-
-finally:
-
-    try:
-        misty.stop_ar_tag_detector()
-    except Exception:
-        pass
-
-    try:
-        misty.stop_face_recognition()
-    except Exception:
-        pass
-
-    try:
-        neutral_head()
-        misty.move_arms(
-            90,
-            90,
-            duration=0.8
-        )
-    except Exception:
-        pass
-
-    misty.unregister_all_events()
+if __name__ == "__main__":
+    raise SystemExit(main())
