@@ -1,17 +1,24 @@
-# Run with PYTHONPATH=Python-SDK python3 misty.py
-from mistyPy.GenerateRobot import RobotGenerator
 from mistyPy.Robot import Robot
+from mistyPy.Events import Events
 
-# Run once to update the command list. Comment this out after it succeeds.
-#RobotGenerator("192.168.0.149")
+misty = Robot("192.168.86.40")
 
-misty = Robot("192.168.0.149")
+def object_test(data):
+    print("OBJECT:", data.get("message", data), flush=True)
 
-# Fetch all preprogrammed actions on the robot
-response = misty.get_actions()
-actions = response.json().get("result", [])
+try:
+    misty.register_event(Events.ObjectDetection, "object_test",
+                         callback_function=object_test, keep_alive=True)
 
-misty.start_action("Love")
+    pose = misty.start_pose_estimation(minimumConfidence=0.5)
+    print("POSE START:", pose.status_code, pose.json(), flush=True)
 
-for action in actions:
-    print(f"Name: {action['name']} | Script: {action['script']}")
+    obj = misty.start_object_detector(minimumConfidence=0.5)
+    print("OBJECT START:", obj.status_code, obj.json(), flush=True)
+
+    print("Stand in front of Misty", flush=True)
+    misty.keep_alive()
+finally:
+    misty.stop_pose_estimation()
+    misty.stop_object_detector()
+    misty.unregister_all_events()
